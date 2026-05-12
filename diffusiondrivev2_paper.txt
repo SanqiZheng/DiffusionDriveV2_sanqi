@@ -1,0 +1,925 @@
+                                          DiffusionDriveV2: Reinforcement Learning-Constrained Truncated Diffusion
+                                                         Modeling in End-to-End Autonomous Driving
+
+                                                  Jialv Zou1,⋄ Shaoyu Chen3 Bencheng Liao2,1 Zhiyu Zheng4,⋄ Yuehao Song1,⋄
+                                                            Lefei Zhang4 Qian Zhang3 Wenyu Liu1 Xinggang Wang1,B
+                                                       1
+                                                           School of Electronic Information and Communications, Huazhong University of Science & Technology
+                                                                   2
+                                                                       Institute of Artificial Intelligence, Huazhong University of Science & Technology
+                                                                          3                      4
+                                                                              Horizon Robotics       School of Computer Science, Wuhan University
+arXiv:2512.07745v1 [cs.CV] 8 Dec 2025
+
+
+
+
+                                                                   Abstract                                        1. Introduction
+                                                                                                                   In recent years, with the growing maturity of traditional
+                                        Diffusion models for trajectory planning in end-to-end au-                 tasks such as 3D object detection [20, 31, 50], multi-object
+                                        tonomous driving often suffer from mode collapse, tend-                    tracking [55, 56], pre-training [51, 54, 58], online map-
+                                        ing to generate conservative and homogeneous behaviors.                    ping [33, 35] and motion prediction [3, 46], the develop-
+                                        While DiffusionDrive employs predefined anchors repre-                     ment wave in autonomous driving systems has shifted to-
+                                        senting different driving intentions to partition the action               wards end-to-end autonomous driving (E2E-AD), which di-
+                                        space and generate diverse trajectories, its reliance on im-               rectly learns a driving policy from raw sensor inputs.
+                                        itation learning lacks sufficient constraints, resulting in a                  Early approaches in this field have limitations in terms
+                                        dilemma between diversity and consistent high quality. In                  of modeling. Traditional end-to-end unimodal planners [8,
+                                        this work, we propose DiffusionDriveV2, which leverages                    18, 22] regress a single trajectory and fail to propose alter-
+                                        reinforcement learning to both constrain low-quality modes                 natives for complex driving scenarios with high uncertainty.
+                                        and explore for superior trajectories. This significantly en-              Selection-based methods [5, 27, 30] use a large, static vo-
+                                        hances the overall output quality while preserving the in-                 cabulary of candidate trajectories, but this discretization of-
+                                        herent multimodality of its core Gaussian Mixture Model.                   fers limited flexibility.
+                                        First, we use scale-adaptive multiplicative noise, ideal for                   Recently, several approaches have employed diffusion
+                                        trajectory planning, to promote broad exploration. Second,                 models for trajectory generation [6, 29, 34, 49, 57], which
+                                        we employ intra-anchor GRPO to manage advantage esti-                      can dynamically produce a small set of candidate trajecto-
+                                        mation among samples generated from a single anchor, and                   ries conditioned on the surrounding scene. However, di-
+                                        inter-anchor truncated GRPO to incorporate a global per-                   rectly applying vanilla diffusion models to multi-modal tra-
+                                        spective across different anchors, preventing improper ad-                 jectory generation faces the challenge of mode collapse,
+                                        vantage comparisons between distinct intentions (e.g., turn-               converging to a single high-probability mode and thus fail-
+                                        ing vs. going straight), which can lead to further mode                    ing to capture the diversity of potential futures, as shown in
+                                        collapse. DiffusionDriveV2 achieves 91.2 PDMS on the                       Fig. 1(a). To address this problem, DiffusionDrive [34] pro-
+                                        NAVSIM v1 dataset and 85.5 EPDMS on the NAVSIM v2                          poses constructing the prior distribution of the initial noise
+                                        dataset in closed-loop evaluation with an aligned ResNet-                  using a Gaussian Mixture Model (GMM) defined by multi-
+                                        34 backbone, setting a new record. Further experiments                     ple predefined trajectory anchors. This structured prior par-
+                                        validate that our approach resolves the dilemma between                    titions the entire generation space into multiple subspaces,
+                                        diversity and consistent high quality for truncated diffu-                 each corresponding to a specific driving intention (e.g.,
+                                        sion models, achieving the best trade-off. Code and model                  one mode for lane changing, another for driving straight),
+                                        will be available at https://github.com/hustvl/                            thereby effectively promoting the generation of diverse be-
+                                        DiffusionDriveV2                                                           havioral modes.
+                                                                                                                       However, DiffusionDrive faces a fundamental dilemma
+                                                                                                                   between the diversity and consistent high quality of its gen-
+                                                                                                                   erated trajectories, stemming from its reliance on the imita-
+                                           ⋄ Intern of Horizon Robotics. B Corresponding author: xgwang@           tion learning (IL) paradigm. While the GMM prior enforces
+                                        hust.edu.cn.                                                               diverse mode generation, its training objective, designed to
+
+
+                                                                                                               1
+                  (a) Vanilla Diffusion                    (b) DiffusionDrive                    (c) DiffusionDriveV2
+Figure 1. Comparison of various models. (a) Vanilla Diffusion models are prone to mode collapse, collapsing diverse possibilities into
+a single trajectory. (b) DiffusionDrive generates trajectories with excellent multimodality, yet constrained by imitation learning, it also
+produces numerous colliding ones (circled in red) as most negative modes lack supervision during training, posing a major threat to the
+system’s overall quality. (c) DiffusionDriveV2 leverages reinforcement learning to apply constraints to multi-modal trajectories, guiding
+the model to generate both diverse and consistent high-quality trajectories.
+
+maximize the likelihood of expert trajectories across the en-           stance, trajectories for turning left and going straight should
+tire mixture model, is simplified in practice to optimizing             coexist rather than be compared for superiority. This in-
+only the parameters of the single positive mode (i.e., the one          sight motivates us to propose Intra-Anchor GRPO to pre-
+closest to the expert trajectory). Consequently, it neglects            vent mode collapse by performing group advantage esti-
+to impose any explicit constraints on trajectories sampled              mation exclusively within each anchor, thereby blocking
+from the negative modes, which constitute the vast majority             comparisons between different intents, and introduce Inter-
+of the samples. This leads to the model generating high-                Anchor Truncated GRPO to provide a global perspective
+quality trajectories alongside a multitude of unconstrained,            and stabilize training.
+low-quality, and often colliding ones, failing to guarantee                 With these innovations, we propose a novel frame-
+consistently high quality, as shown in Fig. 1(b).                       work DiffusionDriveV2, which leverages RL to address the
+    This hazardous mix forces reliance on a downstream se-              dilemma between diversity and consistent high quality of
+lector, which is often less robust than the generator due to            DiffusionDrive that stem from its reliance on IL. We bench-
+much fewer parameters. This over-reliance poses a signif-               mark our method on the planning-oriented NAVSIM v1 [10]
+icant risk, as this component is prone to failure when fil-             and NAVSIM v2 [2] datasets using closed-loop evaluations.
+tering many low-quality trajectories, particularly in out-of-           DiffusionDriveV2 sets a new state-of-the-art on both bench-
+distribution scenarios.                                                 marks, achieving 91.2 PDMS on NAVSIM v1 and 85.5
+    Reinforcement Learning (RL) provides a powerful solu-               EPDMS on NAVSIM v2 with ResNet-34 backbone, which
+tion to this dilemma. In contrast to IL, which is constrained           represents a substantial improvement over previous meth-
+to a single positive mode, RL operates on an exploration-               ods. Furthermore, compared to other diffusion-based gener-
+constraint paradigm. On one hand, it raises the model’s                 ative models, DiffusionDriveV2 achieves the best trade-off
+lower bound by applying goal-alignment constraints to all               between trajectory diversity and consistent high quality.
+modes, rewarding desired behaviors while simultaneously                     Our contributions can be summarized as follows:
+penalizing unsafe actions from negative modes. On the                   • We propose DiffusionDriveV2, a novel approach that in-
+other hand, it raises the model’s upper bound by pushing                   troduces RL to address the dilemma between diversity
+the model to explore a broader action space, seeking poli-                 and consistent high quality of DiffusionDrive, which is
+cies that may exceed the expert’s in quality and efficiency.               caused by the incomplete multi-modal supervision in IL.
+    Spurred by the success of DeepSeek-R1 [15], several                    To the best of our knowledge, DiffusionDriveV2 is the
+works [29, 45] have introduced GRPO to E2E-AD. How-                        first work to directly confront this dilemma and propose a
+ever, their application has been limited to vanilla diffusion              solution.
+models. Unlike these approaches, in anchored truncated dif-             • We introduce Intra-Anchor GRPO and Inter-Anchor
+fusion models, each predefined trajectory anchor represents                Truncated GRPO to solve the issue of inability to per-
+a distinct driving intention. Naively performing advantage                 form group advantage estimation across different modes
+estimation between trajectories corresponding to different                 within the Gaussian Mixture Model framework when di-
+driving intentions would exacerbate mode collapse. For in-                 rectly adapting vanilla GRPO to DiffusionDrive. Dif-
+
+
+                                                                    2
+  fusionDriveV2 is the first work to successfully migrate           O1 [37], to mastering complex games like AlphaGo [42]
+  GRPO to a truncated diffusion model.                              and AlphaGo Zero [43]. Recently, the application of RL
+• We leverage scale-adaptive multiplicative noise as the ex-        in autonomous driving has been increasingly explored. A
+  ploration noise instead of additive noise, which helps pre-       series of works [4, 19, 36] have investigated the use of
+  serve the smoothness and coherence of the exploratory             RL in non-photorealistic simulators, such as CARLA [12].
+  trajectories.                                                     RAD [14] trains an E2E-AD agent in a realistic 3DGS [24]
+• Extensive evaluations on the NAVSIM v1 and NAVSIM                 environment to bridge the sim-to-real gap. Inspired by the
+  v2 benchmarks demonstrate that DiffusionDriveV2 sig-              advancements of Deepseek-R1, the application of GRPO
+  nificantly improves overall output quality while preserv-         has extended to E2E-AD, with AlphaDrive [23] pioneer-
+  ing the ability of the underlying Gaussian Mixture Model          ing its integration into planning reasoning. While subse-
+  to generate multi-modal trajectories, leading to the state-       quent research [26, 29] have investigated applying GRPO to
+  of-the-art performance.                                           diffusion-based generative trajectory models, these efforts
+                                                                    have been confined to direct implementation on vanilla dif-
+2. Related Work                                                     fusion, thus suffering from mode collapse.
+End-to-End Autonomous Driving. Traditional au-
+tonomous driving (AD) systems rely on a highly modular              3. Preliminary
+pipeline, which suffers from limitations such as error              End-to-End Autonomous Driving. The E2E-AD system
+propagation and information loss between components.                learns an expert driving policy via imitation learning, map-
+UniAD [18] represents a pioneering work that addresses              ping raw sensor data to future ego-vehicle trajectory predic-
+these issues by integrating multiple perception tasks               tions. The trajectory is represented by a sequence of future
+into a single, fully differentiable framework, showcasing                                                   Nf
+                                                                    waypoints, denoted as τ = {(xn , yn )}n=1   , where (xn , yn )
+the potential of the end-to-end approach. VAD [22]
+                                                                    is the location of each waypoint at time n and Nf represents
+further improves the system’s efficiency by employing a
+                                                                    the planning horizon.
+vectorized scene representation. Subsequently, a series
+of methods [5, 27, 30, 52], represented by VADv2 [5]
+and Hydra-MDP [30], have shifted to a multi-modal                   Truncated Diffusion Model. Diffusion policy models [7,
+planning framework by performing rule-based scoring and             21] learn a reverse Markovian noise process to generate tra-
+sampling over a fixed vocabulary of anchor trajectories.            jectories by iteratively refining a random Gaussian noise.
+More recently, Diffusion Policy [6] has emerged as a                However, experiments show that vanilla diffusion models
+powerful approach for E2E-AD, effectively modeling                  often suffer from mode collapse, failing to generate diverse
+intricate, multi-modal distributions in high-dimensional            driving behaviors. This makes it difficult for them to handle
+action spaces. Diffusion models learn the data distri-              complex driving scenarios and provide a rich set of alterna-
+bution through an iterative denoising process and have              tive trajectories, such as car-following versus overtaking, or
+achieved remarkable performance in image generation                 going straight versus turning left at an intersection.
+tasks [11, 17, 39, 44]. DiffusionDrive [34] highlights                  To overcome the mode collapse problem of vanilla dif-
+the challenge of mode collapse for diffusion models in              fusion models, DiffusionDrive [34] proposes modeling the
+E2E-AD, introduces an anchor-based truncated denoising              trajectory distribution as a Gaussian Mixture Model Dis-
+strategy to counteract it, and drastically improves effi-           tribution. It achieves this by representing a discrete set
+ciency by reducing the required denoising steps to just             of driving intents as a set of Nanchor anchor trajectories
+                                                                     k Nanchor
+two. Overall, diffusion-based generative models show                  a k=1 clustered using K-Means from the expert driv-
+significant potential for E2E-AD, offering both high quality        ing behaviors. Each anchor corresponds to a specific re-
+and efficient generation. However, these methods are                gion of the trajectory space, thereby representing a particu-
+all fundamentally constrained by the imitation learning             lar driving intent, such as overtaking, turning left, or keep-
+paradigm, which means they typically either face the                ing straight. The trajectory distribution for anchor ak can
+challenge of mode collapse or run the risk of generating            be expressed as:
+numerous low-quality trajectories.
+                                                                          p τ k | ak , z = N τ k | ak + µk (z), Σk (z) .
+                                                                                                                     
+                                                                                                                              (1)
+Reinforcement Learning for Autonomous Driving. Re-
+inforcement Learning drives an agent to explore by inter-           Notably, unlike vanilla diffusion models that directly pre-
+acting with an environment and maximizing the cumulative            dict trajectories from random noise, DiffusionDrive is
+return to learn the optimal policy. RL has proven its effec-        trained to predict the offset between a trajectory and its
+tiveness in various domains, from training Large Language           corresponding anchor ak , with µk (z) representing a scene-
+Models (LLMs) such as DeepSeek-R1 [15] and OpenAI                   specific offset from the anchor state ak conditioned on
+
+
+                                                                3
+                                                                             Multimodal Trajectories                Exploratory Trajectories
+
+
+                                                                                                         Multi Noise
+
+
+
+
+                                        Truncated Diffusion Decoder
+ Anchored Noisy Trajs
+
+
+
+
+                                                                                                                                                      Mode Selector
+                                                                                         𝐴11   𝐴1𝑘       𝐴1𝑁                Groups
+                                                                      Policy Loss                                         Computation
+                                                                                         𝐴12   𝐴k2       𝐴𝑁
+
+
+
+
+                                                                                               …
+
+                                                                                                       …
+                   Encoder
+
+
+
+                                                                                                          2
+                                                                                         …         …       …
+                                                                                         𝐴1𝐺   𝐴𝑘𝐺       𝐴𝑁
+                                                                                                          𝐺
+  Sensor Data
+                                                                                    Anchored Truncated GRPO
+
+
+                                   𝑵×
+                                                                                                                       Refined Trajectories
+Figure 2. Overall architecture of DiffusionDriveV2. Trajectories of different colors represent distinct anchored intents. Solid lines
+indicate high-quality trajectories, while dashed lines indicate low-quality ones. The truncated diffusion decoder, limited by incomplete
+supervision in IL, produces low-quality trajectories (overtake, right turn) alongside high-quality ones (go straight). To address this, we
+first apply multiplicative Gaussian noise to push the model to explore the nearby action space. We then propose Anchored Truncated
+GRPO, which performs intra-group advantage estimation to optimize the model, steering it away from collisions and towards high-quality
+trajectories. The resulting refined trajectories for overtake and right turn become collision-free, while the go straight trajectories become
+more optimal rather than overly conservative. Finally, a mode selector chooses the most goal-aligned trajectory from the refined trajectories.
+
+scene context z. The entire trajectory distribution can be                                                     The training objective is:
+represented as:
+                                                                                                                              NX
+                                                                                                                               anchor
+
+                      Nanchor
+                       X                                                                                                L=              [y k Lrec (τ̂ k , τgt ) + LBCE (ŝk , y k )],   (4)
+                                                      k                      k       k
+                                                                                          
+        p(τ | z) =                 s a | z p τ | a ,z .                                            (2)                         k=1
+                             k=1
+                                                                                                               Due to the constraints of IL, only a single mode receives
+This results in a Gaussian
+                         Mixture Model (GMM) distri-                                                          supervision in each scene. As a result, while the model
+bution, where s ak | z is the mixture weight denoting the                                                      might generate diverse trajectories, it also produces numer-
+probability of choosing the driving intent associated with                                                     ous low-quality ones that could lead to collisions, posing a
+anchor ak , given the scene context z.                                                                         significant hazard to the system.
+   DiffusionDrive utilizes a truncated diffusion process,
+which shortens the standard noise schedule to diffuse each                                                     4. Method
+anchor trajectory into a corresponding anchored Gaussian
+distribution:                                                                                                  4.1. Truncated Diffusion Generator
+               √         √                                                                                     The overall architecture of our proposed method, Diffusion-
+         τtk = ᾱt ak + 1 − ᾱt ϵ, ϵ ∼ N (0, I),       (3)                                                     DriveV2, is illustrated in Fig. 2.
+                                                                                                                   To generate multi-modal trajectories, we directly employ
+where t ∈ [1, Ttrunc ] and Ttrunc ≪ T is the number of trun-                                                   DiffusionDrive as our trajectory generator, leveraging its
+cated diffusion steps. During training, DiffusionDrive takes                                                   pre-trained weights for IL on GT trajectories. This provides
+                         Nanchor
+noisy trajectories τtk k=1 as input and predicts denoised                                                      a cold start, equipping our model with an initial capability
+                  Nanchor
+                                                                                                               for multi-modal trajectory generation. Conditioned on fea-
+             
+trajectories τ̂ k k=1 and the probability scores ŝk , where
+                                  
+sk is a shorthand for s ak | z in Eq. (2).                                                                     tures extracted by the perception network, the truncated dif-
+                                                                                                                                                                Nanchor
+    However, DiffusionDrive is still constrained by the lim-                                                   fusion decoder takes the noisy trajectories τtk k=1 sam-
+itations of IL. Although its anchor-based design mitigates                                                     pled from the anchored Gaussian distribution as input and
+mode collapse and provides diverse trajectory options, the                                                     iteratively refines them over Ninf er steps to produce the fi-
+training process is fundamentally limited by the fact that                                                     nal clean trajectories.
+only a single GT trajectory is available per scene. Conse-
+quently, the model must still select one anchor as the pos-
+                                                                                                               4.2. Reinforcement Learning for Diffusion Genera-
+itive mode for optimization during training. The anchor
+                                                                                                                     tor
+closest to the GT trajectory τgt is assigned as the positive                                                   Although DiffusionDrive demonstrates strong capabilities
+sample (y k = 1) and the others as negative samples (y k = 0).                                                 in generating multi-modal trajectories, it inherits a critical
+
+
+                                                                                                         4
+limitation from imitation learning, namely a lack of supervi-                 However, due to the inherent scale inconsistency be-
+sion on negative modes. This often results in the generation               tween the proximal and distal segments of a trajectory, sim-
+of low-quality trajectories, posing a significant threat to the            ply applying additive Gaussian noise at each point disrupts
+system. To address this, we introduce trajectory-level rein-               the trajectory’s structural integrity and degrades the quality
+forcement learning objectives to apply constraints across all              of exploration. As shown in Fig. 3(a), this process, where
+                                                                                                                              Nf
+modes and push the model to explore superior driving poli-                 additive Gaussian noise ϵadd = {(ϵx,n , ϵy,n )}n=1      is ap-
+cies. Inspired by DPPO [38], we treat the denoising process                                                                    Nf
+                                                                           plied to a normalized trajectory τ = {(xn , yn )}n=1 typi-
+as a Markov Decision Process (MDP). Each conditional de-                   cally produces a jagged exploratory path that resembles a
+noising step in the diffusion chain initiated from anchor ak               broken line, thereby losing its original smoothness. To pre-
+is a Gaussian policy:                                                      serve trajectory coherence, we propose a method that adds
+          k                                                                only two multiplicative Gaussian noises, one longitudinal
+              | τtk , z, ak =N τt−1
+                                  k
+                                      ; µθ τtk , t, z, ak ,
+                                                        
+     πθ τt−1
+                                                                           and one lateral. It can be expressed as τ ′ = (1 + ϵmul )τ ,
+                                   η (1 − αt ) I) ,         (5)            where ϵmul = (ϵlong , ϵlat ) . This scale-adaptive multiplica-
+                                                                          tive noise ensures the resulting exploratory paths remain
+µθ τt , t, z, ak is the model-predicted mean and αt is de-
+                                                                           smooth, as illustrated in Fig. 3(b).
+termined by a predefined noise schedule.
+   This equation is a Gaussian likelihood, which can be
+evaluated analytically and is amenable to the policy gradient              4.4. Intra-Anchor GRPO for Trajectory Generation
+updates with REINFORCE [48]:
+                      "T                                  #                As a reinforcement learning method designed for settings
+                         trunc
+            k
+                        X
+                                        k  k        k
+                                                       k                  with multiple agents or modes, Group Relative Policy Opti-
+   ∇θ J πθ = Eπθk              ∇θ log πθ τt−1 | τt At ,
+                           t=1
+                                                                           mization (GRPO) [41] updates each agent’s policy in rela-
+                                                                (6)        tion to a shared, group-level baseline. This approach di-
+where Akt denotes the advantage function.                                  verges from conventional PPO [40] by defining the pol-
+                                                                           icy gradient through an advantage function that is normal-
+                                                                           ized by group-conditioned expectations. By optimizing for
+                                                                           non-differentiable objectives with trajectory-level rewards,
+                                                                           GRPO enhances standard imitation learning, guiding the
+                                                                           diffusion model to produce diverse, goal-oriented trajecto-
+                                                                           ries with the potential to surpass human-driver performance.
+                                                                              However, naively using trajectories sampled from dif-
+                                                                           ferent anchors as the “group” for the GRPO policy update
+                                                                           would be counterproductive. This approach contradicts our
+                                                                           core motivation for using anchors to partition the trajectory
+                                                                           space into distinct regions that correspond to different driv-
+                                                                           ing intentions, and it would even lead to mode collapse. For
+                                                                           instance, if samples from anchors representing ’turn right’
+                                                                           and ’go straight’ (as shown by the red and green trajectories
+         (a) Additive Noise        (b) Multiplicative Noise                in Fig. 2) were optimized relative to each other, the pol-
+Figure 3. Comparison with Different Noise Strategies for Ex-               icy would likely collapse to the single, more common ’go
+ploration. The green solid line denotes the original trajectory,           straight’ mode. These anchors represent fundamentally dif-
+while the blue and red dashed lines represent the trajectories after       ferent intents and should not be directly compared within
+applying exploration noise.                                                the same optimization group.
+4.3. Scale-Adaptive Multiplicative Exploration                                Based on this insight, we propose Intra-Anchor GRPO.
+     Noise                                                                 For each anchor, we first generate a group of G trajectory
+DiffusionDrive applies the DDIM [44] update rule to dras-                  variations by diffusing the anchor with random Gaussian
+tically reduce the number of denoising steps. This update                  noises and exploration noise. We then perform the GRPO
+rule is typically used as a deterministic sampler by setting               update within this group of G trajectories, rather than across
+η = 0. To enable broader exploration and prevent the issue                 groups from different anchors. This approach constrains
+of calculating a likelihood over a Dirac distribution, we in-              the policy optimization to the state space of each specific
+troduce exploration noise by setting η = 1 during training                 behavioral intent, guiding the model to generate safer and
+(equivalent to applying DDPM [17]), while keeping η = 0                    more goal-oriented trajectories without compromising its
+during validation for deterministic inference.                             multi-modal capabilities. The RL loss function can be rep-
+
+
+                                                                       5
+resented as:                                                            4.6. Mode Selector
+                           Nanchor     G            TX
+                                                     trunc
+                     1      X    1     X  1                             We append a final mode selector to our model, which is
+      LRL = −                                                           responsible for choosing the optimal, goal-aligned trajec-
+                 Nanchor         G i=1 Ttrunc        t=1
+                           k=1
+                                                                      tory from multi-modal predictions representing distinct in-
+                             k,i
+                γt−1 log πθ τt−1 | τtk,i Ak,i ,              (7)        tents. A higher score corresponds to a stronger alignment
+                                                                        with the overall objective. Specifically, the trajectory coor-
+where γt−1 is the discount coefficient mitigating instability           dinates serve as queries, first interacting with BEV features
+in early denoising steps, and Ak,i is the advantage function,           via deformable spatial cross-attention, and then being re-
+which GRPO estimates by computing the group-relative ad-                fined by cross-attention layers with agent and map queries.
+vantage, thereby avoiding the need for a value model.                   Finally, the context-rich representation is passed to a Multi-
+                                                       
+         k,i   rk,i − mean rk,1 , rk,2 , · · · , rk,G                   Layer Perceptron (MLP) to predict the score. Inspired by
+       A =                                                , (8)         DriveSuprim [52], we employ a two-stage, coarse-to-fine
+                    std ({rk,1 , rk,2 , · · · , rk,G })
+                                                                        scorer. The process begins with a coarse scorer that ini-
+denotes the group relative advantage with rk,i = R(τ0k,i ).             tially selects the top-k candidate trajectories, which are sub-
+A single reward estimate R(τ0k,i ), calculated from the final           sequently passed to a fine-grained scorer for a more detailed
+clean trajectory τ0k,i , is applied to all denoising steps in the       selection. The score learning uses the binary cross-entropy
+diffusion chain, with the influence of each step being scaled           (BCE) loss.
+by denoising discount γt−1 ∈ (0, 1).                                        For the continuous metric, we introduce an additional
+   Furthermore, analogous to how the original GRPO pro-                 Margin-Rank loss:
+vides regularization by adding a KL divergence between the
+policy model and the reference model, we incorporate an                           1 X
+                                                                        Lrank =         max (0, − sign (si − sj ) · (ŝi − ŝj ) + m) ,
+additional imitation learning loss to prevent the model from                      N i,j
+overfitting and potentially compromising its general driving                                                                     (11)
+capabilities. The combined loss is                                      where s are the ground truth, while ŝ are predicted scores.
+                     L = LRL + λLIL ,                        (9)        The margin m is a positive hyperparameter. This loss guides
+                                                                        the model to compare the relative quality of trajectories,
+with weight coefficient λ ∈ (0, 1).                                     which avoids the difficulty of directly regressing their ab-
+4.5. Inter-Anchor Truncated GRPO for Trajectory                         solute continuous values. As a result, the model’s abil-
+      Generation                                                        ity to discriminate between subtle differences is further en-
+                                                                        hanced.
+While Intra-Anchor GRPO prevents mode collapse, com-
+pletely isolating the modes introduces a new problem: the               5. Experiments
+advantage estimates lose global comparability. For exam-
+ple, a suboptimal but safe trajectory in one mode could get a           5.1. Benchmark
+negative advantage, while a dangerous, colliding trajectory             Dataset. We evaluate DiffusionDriveV2 on the NAVSIM
+in another mode might get a positive advantage if it’s the              v1 [10] and NAVSIM v2 [2] datasets. NAVSIM offers a
+’best’ sample within its own group. This reliance on local,             collection of real-world, planning-centric driving scenarios
+intra-group comparisons can provide a misleading learning               built upon OpenScene [9], which is a compact version of
+signal to the model.                                                    the extensive nuPlan [1] dataset. It features data from a sen-
+    To address this issue, we introduce Inter-Anchor Trun-              sor suite combining eight cameras for a 360° field of view
+cated GRPO, which is guided by a simple yet powerful                    (FOV) with a merged point cloud from five LiDARs. The
+principle: reward relative improvements, but only penalize              dataset is split into navtrain (1,192 training scenes) and
+absolute failures. We implement this by modifying the ad-               navtest (136 evaluation scenes).
+vantage estimates Ak,i from Intra-Anchor GRPO. Specifi-
+cally, we truncate all negative advantages to zero and assign           5.2. Implementation Details
+a strong penalty of -1 to any trajectory that results in a col-
+                                                                        To ensure a fair comparison, our model employs the same
+lision:
+                                                                        ResNet-34 [16] backbone as Transfuser and Diffusion-
+                     (                                                  Drive, while also matching the diffusion decoder size used
+             k,i        −1              if collision,
+           Atrunc =                                        (10)         in DiffusionDrive. DiffusionDriveV2 takes three cropped
+                        max(0, Ak,i ) otherwise.                        and downscaled forward-facing camera images, concate-
+   This provides the model with a clear and consistent                  nated as a 1024×256 image, and a rasterized BEV repre-
+learning signal. This truncated advantage Ak,i trunc subse-             sentation of the LiDAR point cloud as input. We use the
+quently replaces Ak,i in the RL loss calculation (Eq. (7)).             pre-trained weights from DiffusionDrive as a cold start. Our
+
+
+                                                                    6
+         Method                          Img. Backbone       NC ↑      DAC ↑      TTC ↑      Comf. ↑      EP ↑     PDMS ↑
+         PARA-Drive [47]                   ResNet-34          97.9      92.4       93.0        99.8       79.3       84.0
+         VADv2 [5]                         ResNet-34          97.2      89.1       91.6        100        76.0       80.9
+         UniAD [18]                        ResNet-34          97.8      91.9       92.9        100        78.8       83.4
+         Transfuser [8]                    ResNet-34          97.7      92.8       92.8        100        79.2       84.0
+         DRAMA [53]                        ResNet-34          98.0      93.1       94.8        100        80.1       85.5
+         Hydra-MDP* [30]                   ResNet-34          98.3      96.0       94.6        100        78.7       86.5
+         Hydra-MDP++* [27]                 ResNet-34          97.6      96.0       93.1        100        80.4       86.6
+         GoalFlow* [49]                    ResNet-34          98.3      93.8       94.3        100        79.8       85.7
+         ARTEMIS [13]                      ResNet-34          98.3      95.1       94.3        100        81.4       87.0
+         DiffusionDrive [34]               ResNet-34          98.2      96.2       94.7        100        82.2       88.1
+         WoTE [28]                         ResNet-34          98.5      96.8       94.9        99.9       81.9       88.3
+         DIVER [45]                        ResNet-34          98.5      96.5       94.9        100        82.6       88.3
+         DriveSuprim [52]                  ResNet-34          97.8      97.3       93.6        100        86.7       89.9
+         Hydra-MDP [30]                       V2-99           98.4      97.8       93.9        100        86.5       90.3
+         GoalFlow [49]                        V2-99           98.4      98.3       94.6        100        85.0       90.3
+         DiffusionDriveV2 (Ours)           ResNet-34          98.3      97.9       94.8        99.9       87.5       91.2
+
+Table 1. Comparison on NAVSIM v1 navtest split with closed-loop metrics. *For fair comparison, we use the official scores of versions
+with the same ResNet-34 backbone.
+
+model is then trained for 10 epochs on the navtrain split            in Tab. 2. To ensure a fair comparison, all models evaluated
+using reinforcement learning. We use the AdamW opti-                 in this benchmark utilize the same ResNet-34 backbone.
+mizer with a learning rate of 2 × 10−4 and a total batch size
+of 512, distributed across 8 NVIDIA L20 GPUs. The mode               Diversity and Quality. Inspired by DIVER [45], we in-
+selector was trained for 20 epochs using the same configu-           troduce a Diversity Metric (denoted as Div.) to quanti-
+ration. In inference, similar to DiffusionDrive, our model           tatively evaluate a model’s ability to generate multi-modal
+can generate predictions using only 2 denoising steps. De-           trajectories. The metric defines the unnormalized pairwise
+tailed hyperparameter settings and dataset metric details are        diversity at waypoint n as:
+provided in the supplementary material.
+                                                                                             M −1 XM
+5.3. Main Results                                                         n            2     X
+                                                                                                                 pin − pjn 2 . (12)
+                                                                                                                            
+                                                                       Divraw =
+                                                                                   M (M − 1) i=1 j=i+1
+Result on NAVSIM v1. As shown in Tab. 1, Diffu-
+sionDriveV2 achieves a state-of-the-art performance on
+NAVSIM v1 navtest split, with a PDMS of 91.2. Our                    To ensure scale consistency for trajectories across differ-
+model outperforms DiffusionDrive by 3.1 PDMS and sig-                ent scenarios, they are normalized by the average trajectory
+nificantly boosts the EP score by 5.3, which demonstrates            scale:
+that our model provides higher-quality and more efficient                                                n
+                                                                                                                   !
+                                                                                                     Div raw
+driving strategies. This improvement is attributed to our                   Div n = min 1,        1
+                                                                                                     PM               .      (13)
+                                                                                                               m
+carefully designed reinforcement learning method. Com-                                        ϵ+ M     m=1 ∥pn ∥2
+pared to DIVER, which is also based on reinforcement
+learning, DiffusionDriveV2 also surpasses it by 2.9 PDMS.            We report the average Div n across all waypoints as the fi-
+This result demonstrates the superior effectiveness of our           nal Div. score. To assess the overall quality of the gen-
+Intra-Anchor GRPO and Inter-Anchor Truncated GRPO                    erated trajectories, we further report the Top-K PDMS.
+training framework. Moreover, DiffusionDriveV2 equipped              Since regression-based and selection-based E2E-AD meth-
+with only a ResNet-34 backbone (21.8M params) still out-             ods can only generate deterministic trajectories, we exclu-
+performs GoalFlow and Hydra-MDP, which are built upon                sively compare our approach against other diffusion-based
+the larger V2-99 [25] backbone (96.9M params).                       methods in the navtest dataset. Following Diffusion-
+                                                                     Drive, each model generates 20 trajectories for evaluation.
+Result on NAVSIM v2. DiffusionDriveV2 maintains its                  The results are presented in Tab. 3.
+strong performance on the more challenging NAVSIM v2                    The results presented here are the models’ raw outputs,
+dataset, achieving a new state-of-the-art EPDMS as shown             evaluated before their respective selection modules (i.e.,
+
+
+                                                                 7
+          Method                       NC ↑         DAC ↑    DDC ↑    TL ↑     EP ↑       TTC ↑      LK ↑    HC ↑     EC ↑     EPDMS ↑
+          Ego Status MLP                   93.1      77.9     92.7    99.6     86.0         91.5     89.4    98.3     85.4       64.0
+          Transfuser [8]                   96.9      89.9     97.8    99.7     87.1         95.4     92.7    98.3     87.2       76.7
+          Hydra-MDP++ [27]                 97.2      97.5     99.4    99.6     83.1         96.5     94.4    98.2     70.9       81.4
+          DriveSuprim [52]                 97.5      96.5     99.4    99.6     88.4         96.6     95.5    98.3     77.0       83.1
+          ARTEMIS [13]                     98.3      95.1     98.6    99.8     81.5         97.4     96.5    98.3      -         83.1
+          DiffusionDriveV2 (Ours)          97.7      96.6     99.2    99.8     88.9         97.2     96.0    97.8     91.0       85.5
+
+                           Table 2. Comparison on NAVSIM v2 navtest split with extended closed-loop metrics.
+
+
+ Method                     Div.   PDMS@1         PDMS@5    PDMS@10          Noise Type      NC ↑    DAC ↑   TTC ↑    Comf. ↑    EP ↑   PDMS ↑
+ TransfuserTD [34]           0.1    85.7           85.7       85.7             Add.          98.1     97.2    94.4      99.9     85.3    89.7
+ DiffusionDrive [34]        42.3    93.5           84.3       75.3             Multi.        98.1     97.6    94.5      99.9     85.7    90.1
+ DiffusionDriveV2 (Ours)    30.3    94.9           91.1       84.4
+                                                                          Table 4. Comparison of different type of exploration noise, where
+Table 3. Comparison of Diversity and Top-K PDMS for the                   Add. and Multi. denote Additive Noise and Multiplicative Noise,
+raw generated trajectories on navtest. PDMS@K denotes the                 respectively.
+PDMS score evaluated on the Top-K ranked trajectories.
+
+DiffusionDrive’s classifier and DiffusionDriveV2’s selec-                 Impact of Intra-Anchor GRPO. Tab. 5 shows the im-
+tor). The goal of this analysis is to determine the extent                pact of Intra-Anchor GRPO. The results confirm our the-
+to which these models produce low-quality trajectories and                oretical analysis, demonstrating that for a Gaussian Mix-
+depend on their selection modules to ensure high quality.                 ture Model like DiffusionDrive, which partitions the action
+This over-reliance is a critical concern, as selector modules             space by driving intentions, performing advantage estima-
+typically have fewer parameters, leading to weaker general-               tion within each anchor is critically important.
+ization capabilities. Consequently, they are prone to failure
+in out-of-distribution scenarios, creating a significant haz-                Intra-Anchor     NC ↑   DAC ↑    TTC ↑    Comf. ↑   EP ↑   PDMS ↑
+ard for the system.                                                               ✗           97.9    97.3    93.8      99.5     84.9    89.2
+    The results validate our theory. Vanilla diffusion meth-                      ✓           98.1    97.6    94.5      99.9     85.7    90.1
+ods achieve consistent generation quality but lack diversity,
+collapsing into a single “bored” trajectory. DiffusionDrive                                 Table 5. Impact of Intra-Anchor GRPO.
+achieves very high generation diversity but fails to guaran-
+tee consistent high quality. In contrast, DiffusionDriveV2
+utilizes a meticulously designed RL algorithm to achieve an               Impact of Inter-Anchor Truncated GRPO. Tab. 6
+exploration-constraint effect. It imposes constraints on all              shows the impact of Inter-Anchor Truncated GRPO. With-
+modes, raising the model’s lower bound (Top-10 PDMS),                     out this component, the model is unable to perform cross-
+and pushes the model to explore better policies, raising its              mode comparisons, as the advantage estimates lose their
+upper bound (Top-1 PDMS). DiffusionDriveV2 resolves the                   global comparability and provide a misleading learning sig-
+dilemma between diversity and consistent high quality for                 nal. In contrast, our method introduces global information
+truncated diffusion models, achieving the best trade-off.                 for cross-mode evaluation, leading to superior performance.
+5.4. Ablation Studies
+We conduct a series of ablation studies to verify the effec-                 Inter-Trunc.    NC ↑    DAC ↑   TTC ↑    Comf. ↑    EP ↑   PDMS ↑
+tiveness of each design in DiffusionDriveV2. In this sec-                         ✗           97.7    97.3    93.6      99.9     85.7    89.5
+tion, all ablation studies are conducted with the same set of                     ✓           98.1    97.6    94.5      99.9     85.7    90.1
+hyperparameters for a fair comparison and are trained for
+fewer epochs for rapid validation.                                        Table 6. Impact of Inter-Anchor Truncated GRPO. Inter-Trunc.
+                                                                          stands for Inter-Anchor Truncated GRPO.
+
+The Type of Exploration Noise. Tab. 4 shows the results
+                                                                          6. Conclusion
+of using different exploration noises. The findings confirm
+that scale-adaptive multiplicative noise is superior to addi-             In this work, we have presented DiffusionDriveV2. By
+tive noise, as it effectively addresses the scale inconsistency           combining our proposed Intra-Anchor GRPO and Inter-
+between the proximal and distal parts of a trajectory.                    Anchor Truncated GRPO with a scale-adaptive multiplica-
+
+
+                                                                      8
+tive exploration noise, our framework resolves the dilemma                   Data-driven non-reactive autonomous vehicle simulation and
+between diversity and consistent high quality for Diffusion-                 benchmarking. Advances in Neural Information Processing
+Drive, which is caused by the incomplete multi-modal su-                     Systems, 37:28706–28719, 2024. 2, 6
+pervision from its imitation learning paradigm. Compre-                 [11] Prafulla Dhariwal and Alexander Nichol. Diffusion models
+hensive experiments and qualitative comparisons validate                     beat gans on image synthesis. Advances in neural informa-
+that DiffusionDriveV2 achieves the best trade-off between                    tion processing systems, 34:8780–8794, 2021. 3
+consistent high planning quality and mode diversity and de-             [12] Alexey Dosovitskiy, German Ros, Felipe Codevilla, Anto-
+                                                                             nio Lopez, and Vladlen Koltun. Carla: An open urban driv-
+livers state-of-the-art closed-loop performance.
+                                                                             ing simulator. In Conference on robot learning, pages 1–16.
+                                                                             PMLR, 2017. 3
+References                                                              [13] Renju Feng, Ning Xi, Duanfeng Chu, Rukang Wang, Zejian
+ [1] Holger Caesar, Juraj Kabzan, Kok Seang Tan, Whye Kit                    Deng, Anzheng Wang, Liping Lu, Jinxiang Wang, and Yan-
+     Fong, Eric Wolff, Alex Lang, Luke Fletcher, Oscar Beijbom,              jun Huang. Artemis: Autoregressive end-to-end trajectory
+     and Sammy Omari. nuplan: A closed-loop ml-based plan-                   planning with mixture of experts for autonomous driving.
+     ning benchmark for autonomous vehicles. arXiv preprint                  arXiv preprint arXiv:2504.19580, 2025. 7, 8
+     arXiv:2106.11810, 2021. 6                                          [14] Hao Gao, Shaoyu Chen, Bo Jiang, Bencheng Liao, Yiang
+ [2] Wei Cao, Marcel Hallgarten, Tianyu Li, Daniel Dauner,                   Shi, Xiaoyang Guo, Yuechuan Pu, Haoran Yin, Xiangyu Li,
+     Xunjiang Gu, Caojun Wang, Yakov Miron, Marco Aiello,                    Xinbang Zhang, et al. Rad: Training an end-to-end driv-
+     Hongyang Li, Igor Gilitschenski, et al. Pseudo-simulation               ing policy via large-scale 3dgs-based reinforcement learning.
+     for autonomous driving. arXiv preprint arXiv:2506.04218,                arXiv preprint arXiv:2502.13144, 2025. 3
+     2025. 2, 6                                                         [15] Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song,
+ [3] Yuning Chai, Benjamin Sapp, Mayank Bansal, and Dragomir                 Ruoyu Zhang, Runxin Xu, Qihao Zhu, Shirong Ma, Peiyi
+     Anguelov. Multipath: Multiple probabilistic anchor tra-                 Wang, Xiao Bi, et al. Deepseek-r1: Incentivizing reasoning
+     jectory hypotheses for behavior prediction. arXiv preprint              capability in llms via reinforcement learning. arXiv preprint
+     arXiv:1910.05449, 2019. 1                                               arXiv:2501.12948, 2025. 2, 3
+ [4] Dian Chen, Vladlen Koltun, and Philipp Krähenbühl. Learn-        [16] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun.
+     ing to drive from a world on rails. In Proceedings of the               Deep residual learning for image recognition. In Proceed-
+     IEEE/CVF International Conference on Computer Vision,                   ings of the IEEE conference on computer vision and pattern
+     pages 15590–15599, 2021. 3                                              recognition, pages 770–778, 2016. 6
+ [5] Shaoyu Chen, Bo Jiang, Hao Gao, Bencheng Liao, Qing                [17] Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising dif-
+     Xu, Qian Zhang, Chang Huang, Wenyu Liu, and Xinggang                    fusion probabilistic models. Advances in neural information
+     Wang. Vadv2: End-to-end vectorized autonomous driving                   processing systems, 33:6840–6851, 2020. 3, 5
+     via probabilistic planning. arXiv preprint arXiv:2402.13243,       [18] Yihan Hu, Jiazhi Yang, Li Chen, Keyu Li, Chonghao Sima,
+     2024. 1, 3, 7                                                           Xizhou Zhu, Siqi Chai, Senyao Du, Tianwei Lin, Wenhai
+ [6] Cheng Chi, Zhenjia Xu, Siyuan Feng, Eric Cousineau, Yilun               Wang, et al. Planning-oriented autonomous driving. In Pro-
+     Du, Benjamin Burchfiel, Russ Tedrake, and Shuran Song.                  ceedings of the IEEE/CVF conference on computer vision
+     Diffusion policy: Visuomotor policy learning via action dif-            and pattern recognition, pages 17853–17862, 2023. 1, 3, 7
+     fusion. The International Journal of Robotics Research, page       [19] Yihan Hu, Siqi Chai, Zhening Yang, Jingyu Qian, Kun Li,
+     02783649241273668, 2023. 1, 3                                           Wenxin Shao, Haichao Zhang, Wei Xu, and Qiang Liu. Solv-
+ [7] Cheng Chi, Zhenjia Xu, Siyuan Feng, Eric Cousineau, Yilun               ing motion planning tasks with a scalable generative model.
+     Du, Benjamin Burchfiel, Russ Tedrake, and Shuran Song.                  In European Conference on Computer Vision, pages 386–
+     Diffusion policy: Visuomotor policy learning via action dif-            404. Springer, 2024. 3
+     fusion. The International Journal of Robotics Research, 44         [20] Junjie Huang, Guan Huang, Zheng Zhu, Yun Ye, and Dalong
+     (10-11):1684–1704, 2025. 3                                              Du. Bevdet: High-performance multi-camera 3d object de-
+ [8] Kashyap Chitta, Aditya Prakash, Bernhard Jaeger, Zehao Yu,              tection in bird-eye-view. arXiv preprint arXiv:2112.11790,
+     Katrin Renz, and Andreas Geiger. Transfuser: Imitation                  2021. 1
+     with transformer-based sensor fusion for autonomous driv-          [21] Michael Janner, Yilun Du, Joshua B Tenenbaum, and Sergey
+     ing. IEEE transactions on pattern analysis and machine in-              Levine. Planning with diffusion for flexible behavior synthe-
+     telligence, 45(11):12878–12895, 2022. 1, 7, 8                           sis. arXiv preprint arXiv:2205.09991, 2022. 3
+ [9] OpenScene Contributors. Openscene: The largest up-to-date          [22] Bo Jiang, Shaoyu Chen, Qing Xu, Bencheng Liao, Jiajie
+     3d occupancy prediction benchmark in autonomous driv-                   Chen, Helong Zhou, Qian Zhang, Wenyu Liu, Chang Huang,
+     ing. In Proceedings of the Conference on Computer Vision                and Xinggang Wang. Vad: Vectorized scene representa-
+     and Pattern Recognition, Vancouver, Canada, pages 18–22,                tion for efficient autonomous driving. In Proceedings of the
+     2023. 6                                                                 IEEE/CVF International Conference on Computer Vision,
+[10] Daniel Dauner, Marcel Hallgarten, Tianyu Li, Xinshuo                    pages 8340–8350, 2023. 1, 3
+     Weng, Zhiyu Huang, Zetong Yang, Hongyang Li, Igor                  [23] Bo Jiang, Shaoyu Chen, Qian Zhang, Wenyu Liu, and Xing-
+     Gilitschenski, Boris Ivanovic, Marco Pavone, et al. Navsim:             gang Wang. Alphadrive: Unleashing the power of vlms in
+
+
+                                                                    9
+     autonomous driving via reinforcement learning and reason-                Maptrv2: An end-to-end framework for online vectorized hd
+     ing. arXiv preprint arXiv:2503.07608, 2025. 3                            map construction. International Journal of Computer Vision,
+[24] Bernhard Kerbl, Georgios Kopanas, Thomas Leimkühler,                    133(3):1352–1374, 2025. 1
+     and George Drettakis. 3d gaussian splatting for real-time           [36] Yiren Lu, Justin Fu, George Tucker, Xinlei Pan, Eli Bron-
+     radiance field rendering. ACM Trans. Graph., 42(4):139–1,                stein, Rebecca Roelofs, Benjamin Sapp, Brandyn White,
+     2023. 3                                                                  Aleksandra Faust, Shimon Whiteson, et al. Imitation is not
+[25] Youngwan Lee and Jongyoul Park. Centermask: Real-                        enough: Robustifying imitation with reinforcement learn-
+     time anchor-free instance segmentation. In Proceedings of                ing for challenging driving scenarios. In 2023 IEEE/RSJ
+     the IEEE/CVF conference on computer vision and pattern                   International Conference on Intelligent Robots and Systems
+     recognition, pages 13906–13915, 2020. 7                                  (IROS), pages 7553–7560. IEEE, 2023. 3
+[26] Derun Li, Jianwei Ren, Yue Wang, Xin Wen, Pengxiang Li,             [37] OpenAI. Openai o1. https://openai.com/o1/,
+     Leimeng Xu, Kun Zhan, Zhongpu Xia, Peng Jia, Xianpeng                    2024. 3
+     Lang, et al. Finetuning generative trajectory model with re-        [38] Allen Z Ren, Justin Lidard, Lars L Ankile, Anthony
+     inforcement learning from human feedback. arXiv preprint                 Simeonov, Pulkit Agrawal, Anirudha Majumdar, Ben-
+     arXiv:2503.10434, 2025. 3                                                jamin Burchfiel, Hongkai Dai, and Max Simchowitz.
+[27] Kailin Li, Zhenxin Li, Shiyi Lan, Yuan Xie, Zhizhong                     Diffusion policy policy optimization.        arXiv preprint
+     Zhang, Jiayi Liu, Zuxuan Wu, Zhiding Yu, and Jose M                      arXiv:2409.00588, 2024. 5
+     Alvarez.     Hydra-mdp++: Advancing end-to-end driv-                [39] Robin Rombach, Andreas Blattmann, Dominik Lorenz,
+     ing via expert-guided hydra-distillation. arXiv preprint                 Patrick Esser, and Björn Ommer. High-resolution image
+     arXiv:2503.12820, 2025. 1, 3, 7, 8                                       synthesis with latent diffusion models. In Proceedings of
+                                                                              the IEEE/CVF conference on computer vision and pattern
+[28] Yingyan Li, Yuqi Wang, Yang Liu, Jiawei He, Lue Fan,
+                                                                              recognition, pages 10684–10695, 2022. 3
+     and Zhaoxiang Zhang. End-to-end driving with online tra-
+                                                                         [40] John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Rad-
+     jectory evaluation via bev world model. arXiv preprint
+                                                                              ford, and Oleg Klimov. Proximal policy optimization algo-
+     arXiv:2504.01941, 2025. 7
+                                                                              rithms. arXiv preprint arXiv:1707.06347, 2017. 5
+[29] Yongkang Li, Kaixin Xiong, Xiangyu Guo, Fang Li, Sixu
+                                                                         [41] Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao
+     Yan, Gangwei Xu, Lijun Zhou, Long Chen, Haiyang Sun,
+                                                                              Song, Xiao Bi, Haowei Zhang, Mingchuan Zhang, YK Li,
+     Bing Wang, et al. Recogdrive: A reinforced cognitive frame-
+                                                                              Yang Wu, et al. Deepseekmath: Pushing the limits of math-
+     work for end-to-end autonomous driving. arXiv preprint
+                                                                              ematical reasoning in open language models. arXiv preprint
+     arXiv:2506.08052, 2025. 1, 2, 3
+                                                                              arXiv:2402.03300, 2024. 5
+[30] Zhenxin Li, Kailin Li, Shihao Wang, Shiyi Lan, Zhiding Yu,
+                                                                         [42] David Silver, Aja Huang, Chris J Maddison, Arthur Guez,
+     Yishen Ji, Zhiqi Li, Ziyue Zhu, Jan Kautz, Zuxuan Wu, et al.
+                                                                              Laurent Sifre, George Van Den Driessche, Julian Schrit-
+     Hydra-mdp: End-to-end multimodal planning with multi-
+                                                                              twieser, Ioannis Antonoglou, Veda Panneershelvam, Marc
+     target hydra-distillation. arXiv preprint arXiv:2406.06978,
+                                                                              Lanctot, et al. Mastering the game of go with deep neural
+     2024. 1, 3, 7
+                                                                              networks and tree search. nature, 529(7587):484–489, 2016.
+[31] Zhiqi Li, Wenhai Wang, Hongyang Li, Enze Xie, Chong-                     3
+     hao Sima, Tong Lu, Qiao Yu, and Jifeng Dai. Bevformer:              [43] David Silver, Julian Schrittwieser, Karen Simonyan, Ioannis
+     learning bird’s-eye-view representation from lidar-camera                Antonoglou, Aja Huang, Arthur Guez, Thomas Hubert, Lu-
+     via spatiotemporal transformers. IEEE Transactions on Pat-               cas Baker, Matthew Lai, Adrian Bolton, et al. Mastering the
+     tern Analysis and Machine Intelligence, 2024. 1                          game of go without human knowledge. nature, 550(7676):
+[32] Zhenxin Li, Wenhao Yao, Zi Wang, Xinglong Sun, Joshua                    354–359, 2017. 3
+     Chen, Nadine Chang, Maying Shen, Zuxuan Wu, Shiyi                   [44] Jiaming Song, Chenlin Meng, and Stefano Ermon.
+     Lan, and Jose M Alvarez. Generalized trajectory scor-                    Denoising diffusion implicit models.         arXiv preprint
+     ing for end-to-end multimodal planning. arXiv preprint                   arXiv:2010.02502, 2020. 3, 5
+     arXiv:2506.06664, 2025. 1                                           [45] Ziying Song, Lin Liu, Hongyu Pan, Bencheng Liao,
+[33] Bencheng Liao, Shaoyu Chen, Xinggang Wang, Tianheng                      Mingzhe Guo, Lei Yang, Yongchang Zhang, Shaoqing Xu,
+     Cheng, Qian Zhang, Wenyu Liu, and Chang Huang. Maptr:                    Caiyan Jia, and Yadan Luo. Breaking imitation bottlenecks:
+     Structured modeling and learning for online vectorized hd                Reinforced diffusion powers diverse trajectory generation.
+     map construction. arXiv preprint arXiv:2208.14437, 2022.                 arXiv preprint arXiv:2507.04049, 2025. 2, 7
+     1                                                                   [46] Balakrishnan Varadarajan, Ahmed Hefny, Avikalp Srivas-
+[34] Bencheng Liao, Shaoyu Chen, Haoran Yin, Bo Jiang, Cheng                  tava, Khaled S Refaat, Nigamaa Nayakanti, Andre Cornman,
+     Wang, Sixu Yan, Xinbang Zhang, Xiangyu Li, Ying Zhang,                   Kan Chen, Bertrand Douillard, Chi Pang Lam, Dragomir
+     Qian Zhang, et al. Diffusiondrive: Truncated diffusion model             Anguelov, et al. Multipath++: Efficient information fu-
+     for end-to-end autonomous driving. In Proceedings of the                 sion and trajectory aggregation for behavior prediction. In
+     Computer Vision and Pattern Recognition Conference, pages                2022 International Conference on Robotics and Automation
+     12037–12047, 2025. 1, 3, 7, 8                                            (ICRA), pages 7814–7821. IEEE, 2022. 1
+[35] Bencheng Liao, Shaoyu Chen, Yunchi Zhang, Bo Jiang, Qian            [47] Xinshuo Weng, Boris Ivanovic, Yan Wang, Yue Wang, and
+     Zhang, Wenyu Liu, Chang Huang, and Xinggang Wang.                        Marco Pavone. Para-drive: Parallelized architecture for real-
+
+
+                                                                    10
+     time autonomous driving. In Proceedings of the IEEE/CVF
+     Conference on Computer Vision and Pattern Recognition,
+     pages 15449–15458, 2024. 7
+[48] Ronald J Williams. Simple statistical gradient-following al-
+     gorithms for connectionist reinforcement learning. Machine
+     learning, 8(3):229–256, 1992. 5
+[49] Zebin Xing, Xingyu Zhang, Yang Hu, Bo Jiang, Tong He,
+     Qian Zhang, Xiaoxiao Long, and Wei Yin. Goalflow: Goal-
+     driven flow matching for multimodal trajectories generation
+     in end-to-end autonomous driving. In Proceedings of the
+     Computer Vision and Pattern Recognition Conference, pages
+     1602–1611, 2025. 1, 7
+[50] Chenyu Yang, Yuntao Chen, Hao Tian, Chenxin Tao, Xizhou
+     Zhu, Zhaoxiang Zhang, Gao Huang, Hongyang Li, Yu Qiao,
+     Lewei Lu, et al. Bevformer v2: Adapting modern im-
+     age backbones to bird’s-eye-view recognition via perspective
+     supervision. In Proceedings of the IEEE/CVF conference
+     on computer vision and pattern recognition, pages 17830–
+     17839, 2023. 1
+[51] Honghui Yang, Sha Zhang, Di Huang, Xiaoyang Wu, Haoyi
+     Zhu, Tong He, Shixiang Tang, Hengshuang Zhao, Qibo Qiu,
+     Binbin Lin, et al. Unipad: A universal pre-training paradigm
+     for autonomous driving. In Proceedings of the IEEE/CVF
+     conference on computer vision and pattern recognition,
+     pages 15238–15250, 2024. 1
+[52] Wenhao Yao, Zhenxin Li, Shiyi Lan, Zi Wang, Xinglong
+     Sun, Jose M Alvarez, and Zuxuan Wu. Drivesuprim: To-
+     wards precise trajectory selection for end-to-end planning.
+     arXiv preprint arXiv:2506.06659, 2025. 3, 6, 7, 8
+[53] Chengran Yuan, Zhanqi Zhang, Jiawei Sun, Shuo Sun, Ze-
+     fan Huang, Christina Dao Wen Lee, Dongen Li, Yuhang
+     Han, Anthony Wong, Keng Peng Tee, et al. Drama: An
+     efficient end-to-end motion planner for autonomous driving
+     with mamba. arXiv preprint arXiv:2408.03601, 2024. 7
+[54] Haiming Zhang, Wending Zhou, Yiyao Zhu, Xu Yan, Jiantao
+     Gao, Dongfeng Bai, Yingjie Cai, Bingbing Liu, Shuguang
+     Cui, and Zhen Li. Visionpad: A vision-centric pre-training
+     paradigm for autonomous driving. In Proceedings of the
+     Computer Vision and Pattern Recognition Conference, pages
+     17165–17175, 2025. 1
+[55] Yifu Zhang, Chunyu Wang, Xinggang Wang, Wenjun Zeng,
+     and Wenyu Liu. Fairmot: On the fairness of detection and
+     re-identification in multiple object tracking. International
+     journal of computer vision, 129(11):3069–3087, 2021. 1
+[56] Yifu Zhang, Peize Sun, Yi Jiang, Dongdong Yu, Fucheng
+     Weng, Zehuan Yuan, Ping Luo, Wenyu Liu, and Xinggang
+     Wang. Bytetrack: Multi-object tracking by associating every
+     detection box. In European conference on computer vision,
+     pages 1–21. Springer, 2022. 1
+[57] Zhiyu Zheng, Shaoyu Chen, Haoran Yin, Xinbang Zhang,
+     Jialv Zou, Xinggang Wang, Qian Zhang, and Lefei Zhang.
+     Resad: Normalized residual trajectory modeling for end-to-
+     end autonomous driving. arXiv preprint arXiv:2510.08562,
+     2025. 1
+[58] Jialv Zou, Bencheng Liao, Qian Zhang, Wenyu Liu, and
+     Xinggang Wang. Mim4d: Masked modeling with multi-view
+     video for autonomous driving representation learning. Inter-
+     national Journal of Computer Vision, pages 1–14, 2025. 1
+
+
+                                                                    11
+  DiffusionDriveV2: Reinforcement Learning-Constrained Truncated Diffusion
+                 Modeling in End-to-End Autonomous Driving
+                                              Supplementary Material
+7. Further Experiment Settings                                        employ data augmentation during its training phase. Specif-
+                                                                      ically, we augment the trajectories from our model by ap-
+Dataset and Metrics NAVSIM v1 evaluates each trajec-                  plying multiplicative Gaussian exploration noise, sampled
+tory by feeding it into a simulator, which then provides a            from a standard deviation range of 0.1-0.2. Furthermore,
+score based on the trajectory’s interaction with the environ-         we supplement the training data by randomly sampling 1%
+ment. The PDM score (PDMS) serves as the closed-loop                  of trajectories from the fixed GTRS [32] trajectory vocabu-
+planning metric and is calculated as:                                 lary, which further improves the selector’s robustness. The
+                         
+                           5 × EP + 5 × T T C + 2 × C
+                                                                     detailed hyperparameters are shown in Tab. 7.
+PDMS = N C×DAC×                                               ,
+                                          12                                    Table 7. Hyperparameters for DiffusionDriveV2.
+                                                         (14)
+where the sub-metrics NC, DAC, TTC, C, EP represent the
+                                                                           Stage       Parameter                      Value
+No At-Fault Collisions, Drivable Area Compliance, Time to
+Collision, Comfort, and Ego Progress.                                                  Number of epochs               10
+   NAVSIM v2 proposes an Extended PDM score                                            Batch size                     512
+(EPDMS), based on the previous formulation, which can                                  Learning rate                  2e−4
+be expressed as:                                                                       Weight decay                   1e−4
+                                                                                       Warmup ratio                   0.10
+  EPDMS = NC × DAC × DDC × TL×                                             I
+                                                                                       Learning rate schedule         Cosine
+   (5 × TTC + 2 × C + 5 × EP + 5 × LK + 5 × EC)                                        BC loss weight                 0.1
+                        22                                                             Minimum denoising std          0.04
+                                              (15)                                     Minimum log-variance std       0.10
+                                                                                       Discount factor                0.8
+The extended sub-metrics DDC, TL, LK, HC, and EC cor-
+                                                                                       Number of epochs               20
+respond to the Driving Direction Compliance, Traffic Lights
+                                                                                       Batch size                     512
+Compliance, Lane Keeping, History Comfort and Extended
+                                                                                       Learning rate                  2e−4
+Comfort, respectively.
+                                                                                       Weight decay                   1e−4
+                                                                           II          Warmup ratio                   0.10
+Training Details Our training process is primarily di-                                 Learning rate schedule         Cosine
+vided into two stages. In the first stage, we train the model                          Number of aug trajs.           2
+using reinforcement learning. We use AdamW with a learn-                               Aug noise std                  (0.1, 0.2)
+ing rate of 2×10−4 , weight decay of 1×10−4 , and a cosine                             Percentage of GTRS vocab       1%
+learning rate schedule with a 10% linear warmup. We train
+for 10 epochs with a batch size of 512. Additionally, we set
+the minimum standard deviation of the multiplicative ex-
+ploration noise to 0.04 to push the model towards sufficient          8. Further Ablation Studies
+exploration and prevent entropy collapse. Furthermore, we             Effect of designs in mode selector. Tab. 8 shows the ef-
+set the standard deviation to be atleast 0.1 when evaluat-          fectiveness of our design choices in the mode selector. We
+                                       k,i
+ing the Gaussian likelihood log πθ τt−1    | τtk,i , which im-        observe that a more refined selector design can yield modest
+proves training stability by avoiding large magnitude gradi-          performance gains. Following DriveSuprim, we implement
+ents. The denoising discount factor γ is set to 0.8 to down-          a two-stage, coarse-to-fine selector. A coarse selector first
+weight the contribution of earlier noisy denoising steps in           identifies the top-k candidate trajectories, which are then
+the policy gradient.                                                  passed to a fine-grained selector for a more detailed compar-
+    In the second stage, we train a mode selector to select           ison. This two-stage process leads to a 0.2 PDMS improve-
+the most goal-aligned trajectory from a set of multi-modal            ment over a single-stage approach. The auxiliary ranking
+trajectories. The learning rate and batch size are the same           loss further enhances the model’s capability to discern fine-
+as in the first stage. We train for 20 epochs with a batch            grained differences in the continuous metrics, contributing
+size of 512. To enhance the robustness of our selector, we            an additional 0.2 PDMS gain.
+
+
+                                                                  1
+ Model     Description          NC ↑   DAC ↑   TTC ↑   Comf. ↑   EP ↑   PDMS ↑       Multi-modal scenarios. To evaluate the capability of
+ M0        Base Model           97.9   97.4    94.1     99.9     85.4    89.7        each method in handling complex driving scenarios, we
+ M1        M0 +Coarse2Fine      98.0   97.4    94.3     99.9     85.5    89.9
+ M2        M1 +Rank Loss        98.1   97.6    94.5     99.9     85.7    90.1        conducted visualizations in scenarios with multiple poten-
+                                                                                     tial solutions, primarily at intersections, as shown in Fig. 6.
+         Table 8. Ablation for design choices of mode selector.                      Vanilla Diffusion still suffers from mode collapse, failing to
+                                                                                     provide alternative solutions. While DiffusionDrive offers
+                                                                                     diverse trajectory options (e.g., turning vs. going straight),
+Impact of mode selector. DiffusionDriveV2 employs a                                  it fails to guarantee consistent high quality. In contrast, Dif-
+more complex mode selector compared to DiffusionDrive’s                              fusionDriveV2 effectively resolves the dilemma between
+classifier. To verify that our model’s superiority is not                            diversity and consistent high quality.
+primarily attributed to this more complex selector, we
+performed an ablation study, with results presented in
+Tab. 9. Equipped with the same mode selector as Diffusion-
+DriveV2, DiffusionDrive improved by 1 PDMS, but still
+lags significantly behind DiffusionDriveV2.
+
+ Model               Selector   NC ↑   DAC ↑   TTC ↑   Comf. ↑   EP ↑   PDMS ↑
+ DiffusionDrive          ✗      98.2    96.2    94.7    100      82.2    88.1
+ DiffusionDrive          ✓      97.2    97.0    92.2    100      86.8    89.1
+ DiffusionDriveV2        ✓      98.3    97.9    94.8    99.9     87.5    91.2
+
+
+                  Table 9. The impact of mode selector.
+
+
+
+9. Qualitative Comparison
+In this section, we provide additional qualitative compar-
+isons of Vanilla Diffusion, DiffusionDrive, and Diffusion-
+DriveV2 in challenging scenarios from the navtest split
+of the planning-oriented NAVSIM dataset [10]. For each
+method, we generate 20 trajectories. We use highly trans-
+parent colors to represent the candidate trajectories and
+highlight the Top-1 and Top-10 trajectories.
+
+Going straight scenarios. Fig. 4 illustrates the perfor-
+mance of different methods in relatively simple straight-
+driving scenarios. Vanilla Diffusion collapses to a sin-
+gle trajectory. While DiffusionDrive performs well in the
+straight-driving task, it still generates numerous colliding
+and off-road trajectories (circled in red). In contrast, the tra-
+jectories produced by DiffusionDriveV2 are more focused,
+with all candidate trajectories being of high quality.
+
+Turning scenarios. Fig. 5 illustrates the performance of
+different methods in turning scenarios. Similarly, Vanilla
+Diffusion collapses to a single trajectory. For Diffusion-
+Drive, while the Top-1 trajectory performs well, the Top-10
+trajectory exhibits delayed turning, resulting in a collision;
+moreover, it generates numerous colliding candidate trajec-
+tories. In contrast, DiffusionDriveV2 ensures high quality
+across all generated trajectories while preserving diversity.
+For instance, in Fig. 5b, the Top-1 trajectory adopts a more
+conservative car-following behavior, whereas the Top-10
+trajectory executes a more aggressive overtaking maneuver
+on the curve.
+
+
+                                                                                 2
+                Vanilla Diffusion
+         t=4s                 t=4s
+                 Top-1 Traj          Top-10 Traj    DiffusionDrive                   DiffusionDriveV2
+         t=0s                 t=0s
+                                                   (a) Straight Scenario 1.
+
+
+
+
+                Vanilla Diffusion
+         t=4s                 t=4s
+                 Top-1 Traj          Top-10 Traj    DiffusionDrive                   DiffusionDriveV2
+         t=0s                 t=0s
+                                                   (b) Straight Scenario 2.
+
+Figure 4. Qualitative comparison of Vanilla Diffusion, DiffusionDrive, and DiffusionDriveV2 on going straight scenarios of
+NAVSIM navtest split.
+
+
+
+
+                                                              3
+                Vanilla Diffusion
+         t=4s                 t=4s
+                 Top-1 Traj          Top-10 Traj    DiffusionDrive                   DiffusionDriveV2
+         t=0s                 t=0s
+                                                   (c) Straight Scenario 3.
+Figure 4. Qualitative comparison of Vanilla Diffusion, DiffusionDrive, and DiffusionDriveV2 on going straight scenarios of
+NAVSIM navtest split.
+
+
+
+
+                Vanilla Diffusion
+         t=4s                 t=4s
+                 Top-1 Traj          Top-10 Traj    DiffusionDrive                   DiffusionDriveV2
+         t=0s                 t=0s
+                                                   (a) Turning Scenario 1.
+
+Figure 5. Qualitative comparison of Vanilla Diffusion, DiffusionDrive, and DiffusionDriveV2 on turning scenarios of NAVSIM
+navtest split.
+
+
+
+                                                              4
+                Vanilla Diffusion
+         t=4s                 t=4s
+                 Top-1 Traj          Top-10 Traj    DiffusionDrive                   DiffusionDriveV2
+         t=0s                 t=0s
+                                                   (b) Turning Scenario 2.
+
+
+
+
+                Vanilla Diffusion
+         t=4s                 t=4s
+                 Top-1 Traj          Top-10 Traj    DiffusionDrive                   DiffusionDriveV2
+         t=0s                 t=0s
+                                                   (c) Turning Scenario 3.
+Figure 5. Qualitative comparison of Vanilla Diffusion, DiffusionDrive, and DiffusionDriveV2 on turning scenarios of NAVSIM
+navtest split.
+
+
+
+
+                                                             5
+                 Vanilla Diffusion
+          t=4s                t=4s
+                 Top-1 Traj          Top-10 Traj      DiffusionDrive                   DiffusionDriveV2
+          t=0s                t=0s
+                                                   (a) Multi-Modal Scenario 1.
+
+
+
+
+                 Vanilla Diffusion
+          t=4s                t=4s
+                 Top-1 Traj          Top-10 Traj      DiffusionDrive                   DiffusionDriveV2
+          t=0s                t=0s
+                                                   (b) Multi-Modal Scenario 2.
+
+Figure 6. Qualitative comparison of Vanilla Diffusion, DiffusionDrive, and DiffusionDriveV2 on multi-modal scenarios of NAVSIM
+navtest split.
+
+
+
+
+                                                               6
+

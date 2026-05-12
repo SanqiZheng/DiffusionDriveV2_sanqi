@@ -35,6 +35,32 @@ from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import (
 )
 import matplotlib as mpl
 from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import MultiMetricIndex, WeightedMetricIndex
+
+
+
+
+
+"""
+当前代码文件包括:
+1. PDM 打分辅助函数
+2. 整体模型 V2TransfuserModel
+3. 目标检测头 AgentHead
+4. 扩散轨迹decoder组件
+5. 自定义 scheduler   DDIMScheduler_with_logprob
+
+"""
+
+
+
+
+
+
+
+
+
+
+# 把 no_collision / drivable_area / progress / ttc / comfort / dir_weighted / final 全部拆出来
+# 如果 no_collision 或 drivable_area 不达标，代码会直接把优势设成负值或无效
 def _pairwise_subscores(scorer):
     """
     从已调用过 score_proposals 的 PDMScorer 中
@@ -72,6 +98,16 @@ def _pairwise_subscores(scorer):
         "dir_weighted"  : wm[WeightedMetricIndex.DRIVING_DIRECTION,1:].copy(),
         "final"         : prod[1:] * wscore[1:],                               # 总分
     }
+
+
+# PDM 打分辅助函数
+# 从 PDMScorer 的内部缓存中重新算出每条候选轨迹的最终score， 返回 shape 为 (G,)  其中 G 是候选轨迹数
+# 关键点: 
+# 1. 并非直接采信 scorer.score_proposals 的全局归一化结果
+# 2. 把 progress 指标重新按"参考 proposal vs 当前proposal"的方式归一化
+# 3. 最终分数为  multiplicative metrics * weighted metrics
+# 物理意义:
+# 先做“碰撞检测” ，再计算“可行驶区域” “进度” “TC” “舒适度” “驾驶方向”
 def _pairwise_scores(scorer) -> np.ndarray:
     """
     使用 scorer 在 batch 模式下缓存的中间结果，
@@ -116,6 +152,11 @@ def _pairwise_scores(scorer) -> np.ndarray:
 
     return final_scores.astype(np.float32)                       # (G,)
 
+
+# 在子进程里加载 metric_cache.pkl, 调用 pdm_score_para 计算每个轨迹的 reward
+# 返回 总分 和 子分数
+# 因为 PDM simulator 和 scorer 很重， 且batch 内每个样本的cache文件不同
+# 放到 ProcessPoolExecutor 里并行计算, 比主进程串行快很多
 def _pdm_worker(args):
     cache, traj_np = args
     # if isinstance(cache, str): 
@@ -139,7 +180,68 @@ def _init_pool(sim_cfg, scorer_cfg):
     SIMULATOR = instantiate(sim_cfg)
     SCORER    = instantiate(scorer_cfg)
 
-    
+
+"""
+1. 用 Transfuser backbone 把相机、激光雷达、ego状态编码成场景特征
+2. 从一组固定的轨迹 anchor 出发，加一点噪声，得到很多“候选轨迹”
+3. 用一个条件去噪网络逐步把这些带噪轨迹修正成合理的未来轨迹
+4. 用 PDM simulator + PDM scorer 计算每个轨迹的 reward, 再把分数回传成 RL loss
+"""
+
+
+
+"""
+标准 diffusion 的训练逻辑:
+1. 先拿一个真实样本 x0
+2. 逐步加噪, 得到 xt
+3. 模型根据 xt 和时间步 t 生成一个 xt+1, 并计算 xt+1 与 xt 的 loss, 学习恢复真实样本
+
+常见预测目标: 
+1. 预测噪声 epsilon
+2. 预测速度 v
+3. 直接预测干净样本 x_start
+
+"""
+
+"""
+当前工程预测目标为直接预测干净样本 x_start, 
+
+此项目样本是未来轨迹点序列, 具体的说，主扩散空间里真正用于预测的是 x_start:
+
+核心思想:
+1. 用 KMeans 从训练集轨迹里聚出 20 个anchor
+2. 每个 anchor 对应一种驾驶意图，比如直行、变道、转弯
+3. 从“anchor附近的带噪轨迹”开始扩散
+即，先把动作空间粗分区, 再从“anchor附近的带噪轨迹”开始扩散
+
+RL引入 - 核心矛盾:
+1. 纯 imitation learning 很容易只监督“离 GT 最近的那个 mode”
+2. 其余 mode 没有真正约束
+
+RL 解决方案:
+1. 不只奖励"像GT", 还要奖励"闭环(PDM)表现好"
+2. 让危险轨迹真的真的被惩罚
+3. 让模型可以探索出比监督目标更优的轨迹
+
+用 RL 的核心:
+采样轨迹 -> 环境指标打分(计算reward) -> 策略梯度更新模型
+
+
+后处理流程:
+    未来 8 个时刻的(x, y)轨迹点 -> 先经过归一化 -> 最后再通过 bezier_xyyaw 推出 yaw
+
+"""
+
+
+
+
+# 从传感器到query的总入口
+"""
+1. TransfuserBackbone 提取图像和激光雷达融合特征
+2. 一个 transformer decoder 产生 trajectory_query 和 agents_query
+3. TrajectoryHead 负责轨迹扩散规划
+4. AgentHead 负责 2D agent box 检测
+"""
 class V2TransfuserModel(nn.Module):
     """Torch module for Transfuser."""
 
@@ -159,6 +261,8 @@ class V2TransfuserModel(nn.Module):
         self._config = config
         self._backbone = TransfuserBackbone(config)
 
+        # 给每个 token 一个可学习的位置/身份 embedding， 此处写死 8**2 + 1 ，即 8x8 feature grid + trajectory
+        # 默认最后 token 网格是 8x8
         self._keyval_embedding = nn.Embedding(8**2 + 1, config.tf_d_model)  # 8x8 feature grid + trajectory
         self._query_embedding = nn.Embedding(sum(self._query_splits), config.tf_d_model)
 
@@ -218,18 +322,48 @@ class V2TransfuserModel(nn.Module):
         )
 
 
+    """
+    1. 读入 camera_feature, lidar_feature, status_feature
+    2. backbone 做图像-激光融合
+    3. 把 bev_feature 压成256通道 token
+    4. status_feature 编码成 status token
+    5. 拼成 keyval
+    6. 把空间 token 重新还原成 BEV 稠密图，并与高分辨率 BEV 拼接，得到 cross_bev_feature
+    7. 用 learnable_query 去读 keyval
+    8. 拆出 trajectory_query 和 agents_query
+    9. 第一次调用 _trajectory_head 采样轨迹, 收集轨迹链和reward
+    10. 第二次调用 _trajectory_head 计算 RL loss, 并再接 AgentHead
+
+
+    不是直接"把backbone输出直接丢给轨迹头", 而是刻意构造:
+    a. keyval 负责全局语义与token级推理
+    b. cross_bev_feature 负责轨迹点到地图的局部几何读取
+
+    正向思维:
+    a. 全局token很强, 但不适合直接做每个轨迹点的局部空间采样
+    b. 稠密特征很细, 但缺乏transformer融合后的全局语义
+    
+    """
     def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None, eta=0.0, metric_cache=None, cal_pdm=True,token=None) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
 
         camera_feature: torch.Tensor = features["camera_feature"]
         lidar_feature: torch.Tensor = features["lidar_feature"]
+
+        # 共8维语义， 4维驾驶指令， 2维速度， 2维加速度
         status_feature: torch.Tensor = features["status_feature"]
 
         batch_size = status_feature.shape[0]
 
+        # step1: backbone 做多模态融合
+        # bev_feature_upscale 分辨率较高，更适合做 BEV 语义地图和局部空间采样
+        # bev_feature 分辨较低，更紧凑的全局fuse_feature, 更适合做全局空间采样
+        # 即，同一个backbone同时输出了 一个适合 token 处理的抽象表示，一个适合空间采样的稠密表示
         bev_feature_upscale, bev_feature, _ = self._backbone(camera_feature, lidar_feature)
         cross_bev_feature = bev_feature_upscale
         bev_spatial_shape = bev_feature_upscale.shape[2:]
+
+        # step2: 把 bev_feature 变成 token
         concat_cross_bev_shape = bev_feature.shape[2:]
         bev_feature = self._bev_downscale(bev_feature).flatten(-2, -1)
         bev_feature = bev_feature.permute(0, 2, 1)
@@ -238,23 +372,50 @@ class V2TransfuserModel(nn.Module):
         keyval = torch.concatenate([bev_feature, status_encoding[:, None]], dim=1)
         keyval += self._keyval_embedding.weight[None, ...]
 
+        # step3: 重建一个 cross_bev_feature
+        # 把token分支的全局抽象信息重新还原到BEV空间，再和高分辨率BEV特征拼接起来，形成适合局部轨迹点采样的稠密地图特征
+        
+        # keyval[:,:-1] 去掉 status_encoding[:, None] 添加的最后的 status token, 只保留前64个空间token
+        # 因为 status token 没有空间坐标，无法还原成 feature map
+        # 
         concat_cross_bev = keyval[:,:-1].permute(0,2,1).contiguous().view(batch_size, -1, concat_cross_bev_shape[0], concat_cross_bev_shape[1])
         # upsample to the same shape as bev_feature_upscale
 
+        # 上采样到bev_feature_upscale 的大小
         concat_cross_bev = F.interpolate(concat_cross_bev, size=bev_spatial_shape, mode='bilinear', align_corners=False)
-        # concat concat_cross_bev and cross_bev_feature
+        # concat_cross_bev 带有 transformer全局融合语义
+        # cross_bev_feature 来自backbone的高分辨率稠密BEV特征
         cross_bev_feature = torch.cat([concat_cross_bev, cross_bev_feature], dim=1)
 
+        # 先把BEV图 flatten 成token，再做 MLP 投影，把拼接后的 320维特征 通过线性层投影到 256维
         cross_bev_feature = self.bev_proj(cross_bev_feature.flatten(-2,-1).permute(0,2,1))
         cross_bev_feature = cross_bev_feature.permute(0,2,1).contiguous().view(batch_size, -1, bev_spatial_shape[0], bev_spatial_shape[1])
         query = self._query_embedding.weight[None, ...].repeat(batch_size, 1, 1)
         query_out = self._tf_decoder(query, keyval)
 
+        # 兼容原多任务结构，一边做规划，一边做BEV语义图
         bev_semantic_map = self._bev_semantic_head(bev_feature_upscale)
         trajectory_query, agents_query = query_out.split(self._query_splits, dim=1)
 
         output: Dict[str, torch.Tensor] = {"bev_semantic_map": bev_semantic_map}
 
+        """
+        RL 设计的关键: 两次调用  self._trajectory_head
+        第一次调用: 采样旧轨迹链
+        1. 从 anchor + 噪声出发跑一遍扩散采样
+        2. 得到一整条 all_diffusion_output
+        3. 调用 PDM scorer 算 reward
+        4. 构造 advantages
+    
+                
+        第二次调用: 传入了old_pred, 无需重新用旧轨迹链计算当前损失， _trajectory_head 不再
+        重新采样，而是进入 get_rlloss(...):
+        1. 读取旧轨迹链
+        2. 重新评估当前策略对这些 transition 的 log-prob
+        3. 用 advantages 组装策略梯度损失
+        即为 RL 中的 policy update
+        
+        """
         with torch.no_grad():
             old_pred = self._trajectory_head(trajectory_query,agents_query, cross_bev_feature,bev_spatial_shape,status_encoding[:, None],status_feature,camera_feature,targets=targets,global_img=None,eta=eta, old_pred=None,metric_cache=metric_cache, cal_pdm=cal_pdm,token=token)
         pred = self._trajectory_head(trajectory_query,agents_query, cross_bev_feature,bev_spatial_shape,status_encoding[:, None],status_feature,camera_feature,targets=targets,global_img=None,eta=eta, old_pred=old_pred,metric_cache=metric_cache, cal_pdm=cal_pdm)
@@ -264,6 +425,7 @@ class V2TransfuserModel(nn.Module):
             pred['sub_rewards'] = old_pred['sub_rewards']
         output.update(pred)
 
+        # 预测其他车辆的轨迹
         agents = self._agent_head(agents_query)
         output.update(agents)
 
@@ -408,6 +570,9 @@ class CustomTransformerDecoderLayer(nn.Module):
         super().__init__()
         self.dropout = nn.Dropout(0.1)
         self.dropout1 = nn.Dropout(0.1)
+
+        # 不是对整张图做全局attention, 而是把轨迹点坐标归一化后，直接去 BEV feature图上 grid_sample
+        # 即，让轨迹去地图上取值，比全局attention更高效
         self.cross_bev_attention = GridSampleCrossBEVAttention(
             config.tf_d_model,
             config.tf_num_head,
@@ -452,7 +617,10 @@ class CustomTransformerDecoderLayer(nn.Module):
                 time_embed, 
                 status_encoding,
                 global_img=None):
+        # 当前 "noisy 轨迹上的每个点" 去 BEV 地图上采样局部特征
         traj_feature = self.cross_bev_attention(traj_feature,noisy_traj_points,bev_feature,bev_spatial_shape)
+        
+        # 读周围 agent_query
         traj_feature = traj_feature + self.dropout(self.cross_agent_attention(traj_feature, agents_query,agents_query)[0])
         traj_feature = self.norm1(traj_feature)
         
@@ -515,7 +683,14 @@ class CustomTransformerDecoder(nn.Module):
             traj_points = poses_reg[...,:2].clone().detach()
         return poses_reg_list, poses_cls_list
 
+# 相较于普通DDIMScheduler，添加了logprob计算，自定义了乘性噪声采样
+# RL训练时并不是直接对 reward 反传，而是要先知道:当前策略在每一步产生
+# 这次 transition 的概率有多大, 这个概率即为 logprob
 class DDIMScheduler_with_logprob(DDIMScheduler):
+    # 数学公式 p_theta(x_{t-1} | x_{t}, c)
+    # 其中， x_{t-1} 是下一步更干净一点的轨迹, x_{t} 是当前noisy trajectory,  c 是场景条件信息
+    # 网络自己先输出 x0_hat, 
+    # scheduler 再计算 transition mean, transition variance, sampled x_{t-1}, 以及 sampled transition 的log_prob
     def step(
         self,
         model_output: torch.Tensor,
@@ -576,24 +751,36 @@ class DDIMScheduler_with_logprob(DDIMScheduler):
         # - pred_sample_direction -> "direction pointing to x_t"
         # - pred_prev_sample -> "x_t-1"
 
-        # 1. get previous step value (=t-1)
+        # 1. get previous step value (=t-1)  先得到前一个 timestep的 sample
+        # 当前在t, 要回推到 t-1,  (按照当前inference步数在1000个训练时间步上等间隔跳)
         prev_timestep = (
             timestep - self.config.num_train_timesteps // self.num_inference_steps
         )
+
         # # to prevent OOB on gather
         # prev_timestep = torch.clamp(prev_timestep, 0, self.config.num_train_timesteps - 1)
-        # 2. compute alphas, betas
-        alpha_prod_t = self.alphas_cumprod[timestep]
+        # 2. compute alphas, betas   取出扩散系数
+        alpha_prod_t = self.alphas_cumprod[timestep]        # 决定当前样本还保留多少"原样本成分"
         alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
 
-        beta_prod_t = 1 - alpha_prod_t
+        beta_prod_t = 1 - alpha_prod_t      # 决定当前样本里有多少"噪声成分"
 
+        """
+        当前 网络直接预测 x_0, 再由 x_t 和 x_0 反推隐含噪声 epsilon
+        
+        与 epsilon-prediction 的区别是:
+        epsilon-prediction 先猜噪声 epsilon, 再根据 x_t 和 x_0 反推 x_0
+
+        网络直接在 "未来轨迹空间" 中工作
+        """
         # 3. compute predicted original sample from predicted noise also called
         # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
         if self.config.prediction_type == "epsilon":
             pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
             pred_epsilon = model_output
         elif self.config.prediction_type == "sample":
+            # 此处把模型输出直接当成预测的干净样本，而不是噪声。因此此处学习的目标是 x_start, 而非噪声
+            # 即， 模型直接输出 x_0, 而不是噪声 epsilon
             pred_original_sample = model_output
             pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
         elif self.config.prediction_type == "v_prediction":
@@ -627,6 +814,9 @@ class DDIMScheduler_with_logprob(DDIMScheduler):
         pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2).clamp_(min=0) ** (0.5) * pred_epsilon
 
         # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+        # 计算无噪声均值 
+        # 这一步的直觉是: 如果不再注入随机噪声， 纯依赖当前预测的 x_0 来回推 x_t， 理论上下一步最合理的均值在哪里？
+        # prev_sample_mean 就是"策略分布的均值"
         prev_sample_mean = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
 
         if prev_sample_mean is not None and generator is not None:
@@ -635,6 +825,18 @@ class DDIMScheduler_with_logprob(DDIMScheduler):
                 " `prev_sample` stays `None`."
             )
 
+        # 在当前实现中，  std_dev_t_add 基本就是 0
+        """
+        使用乘性噪声，物理直觉:
+        轨迹不是图片像素，它的不同时间点、不同方向，尺度差异很明显:
+        前向x通常变化大, 横向 y 通常变化小。
+        远端点可容忍更大探索，近端点不宜乱抖
+
+        纯加性噪声像"每个位置加同样尺度的随机偏移", 对轨迹几何很不友好
+        乘性噪声更像"沿原轨迹尺度做相对伸缩", 更容易保留整体走势
+
+        论文中提到的 scale-adaptive multiplicative noise
+        """
         if eta > 0:
             std_dev_t_mul = torch.clip(std_dev_t, min=0.04)
             std_dev_t_add = torch.tensor(0.0).to(std_dev_t.device)
@@ -642,7 +844,11 @@ class DDIMScheduler_with_logprob(DDIMScheduler):
             std_dev_t_mul = torch.tensor(0.0).to(std_dev_t.device)
             std_dev_t_add = torch.tensor(0.0).to(std_dev_t.device)
         if prev_sample is None:
-            # 乘性噪声
+
+            # 分 horizontal / vertical 两个方向再拼成 2 维坐标噪声
+            # 因为 x, y 的尺度差异很大，探索统计性质不一致，所以不应该简单共享同一个噪声表来嗯，
+            # 需要分别处理，再拼成 2 维坐标噪声
+            # 乘性噪声 "沿原轨迹尺度做相对伸缩", 更容易保留整体走势
             variance_noise_horizon = randn_tensor(
                 [model_output.shape[0],model_output.shape[1],1,1], generator=generator, device=model_output.device, dtype=model_output.dtype
             ) * std_dev_t_mul + 1.0
@@ -663,19 +869,28 @@ class DDIMScheduler_with_logprob(DDIMScheduler):
             variance_noise_add = torch.cat((variance_noise_x,variance_noise_y),dim=-1)
             variance_noise_add = variance_noise_add.repeat(1,1,model_output.shape[2],1)
 
+            # 乘性噪声 + 加性噪声
             prev_sample = prev_sample_mean * variance_noise_mul + std_dev_t_add * variance_noise_add
 
         std_dev_t_mul = torch.clip(std_dev_t, min=0.1)
+        
+        # 高斯分布对数概率密度
+        # 把 prev_sample_mean 当做均值，std_dev_t_mul 当做标准差，计算对数概率密度
+        # 检查本次采样得到的 prev_sample 在当前策略分布下有多大概率
+        # 对于diffusion, 一整条轨迹生成过程被拆成很多步 transition
+        # 对 RL 训练，每个 transition 都需要计算 log_prob，最后求和
         log_prob = (
             -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (std_dev_t_mul**2))
             - torch.log(std_dev_t_mul)
             - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
         )   
-
         log_prob = log_prob.sum(dim=(-2, -1))
         return prev_sample.type(sample.dtype), log_prob, prev_sample_mean.type(sample.dtype)
 
-
+"""
+模型学习的是 x_start, 而非 noise_epsilon / velocity
+模型直接预测去噪后的轨迹样本，样本所在空间是“归一化后的轨迹坐标空间”
+"""
 class TrajectoryHead(nn.Module):
     """Trajectory prediction head."""
 
@@ -694,29 +909,43 @@ class TrajectoryHead(nn.Module):
         self.diff_loss_weight = 2.0
         self.ego_fut_mode = 20
 
+        # 做少量denoising steps, 而不是标准长链diffusion
+        # 训练和推理都从 trunc_timesteps=8 开始
+        # RL 训练时 step_num=10, 推理时 step_num=2
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=1000,
             steps_offset=1,
             beta_schedule="scaled_linear",
             prediction_type="sample",
         )
+
+        # 训练时采样 + 输出 log_prob
         self.diffusionrl_scheduler = DDIMScheduler_with_logprob(
             num_train_timesteps=1000,
             steps_offset=1,
             beta_schedule="scaled_linear",
             prediction_type="sample",
         )
+
+        # 每个 anchor 复制次数
         self.num_groups = config.num_groups
         plan_anchor = np.load(plan_anchor_path)
 
+        # 用一组预聚类的anchor来表示不同驾驶意图，扩散从这些anchor的邻域开始，而不是从纯高斯白噪声开始
+        # 每个 anchor 是未来 8 个时间点的 (x, y) 轨迹
+        # 20 个 KMeans 轨迹原型, shape （20, 8, 2）
         self.plan_anchor = nn.Parameter(
             torch.tensor(plan_anchor, dtype=torch.float32),
             requires_grad=False,
         ) # 20,8,2
+
+        # 把轨迹点位置编码后投影到 d_model=256 维空间
         self.plan_anchor_encoder = nn.Sequential(
             *linear_relu_ln(d_model, 1, 1,512),
             nn.Linear(d_model, d_model),
         )
+
+        # 把扩散步 t 编码成时间条件
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(d_model),
             nn.Linear(d_model, d_model * 4),
@@ -724,12 +953,18 @@ class TrajectoryHead(nn.Module):
             nn.Linear(d_model * 4, d_model),
         )
         self.sigmoid = nn.Sigmoid()
+        
+        # 条件注入去噪的核心
+        # 按顺序注入 地图(cross_bev_attention) -> 周围车信息(cross_agent_attention)
+        # -> ego全局信息(cross_ego_attention) -> 扩散时间条件(time_modulation)
         diff_decoder_layer = CustomTransformerDecoderLayer(
             num_poses=num_poses,
             d_model=d_model,
             d_ffn=d_ffn,
             config=config,
         )
+
+        # 执行去噪refinement
         self.diff_decoder = CustomTransformerDecoder(diff_decoder_layer, 1)
 
         self.loss_computer = LossComputer(config)
@@ -742,6 +977,7 @@ class TrajectoryHead(nn.Module):
         self.simulator_cfg = pdm_cfg.simulator
         self.scorer_cfg = pdm_cfg.scorer
 
+        # 并行调用 PDM scorer 计算 reward
         self._pdm_pool = cf.ProcessPoolExecutor(
             max_workers=16,
             mp_context=mp.get_context("spawn"),
@@ -797,10 +1033,16 @@ class TrajectoryHead(nn.Module):
         sub_scores  = [f.result()[2] for f in futures]
         return torch.from_numpy(scores_np).to(trajectory.device), metric_cache, sub_scores
 
+    # 这个函数不是直接输出最终loss， 更像 "采样经验 + 计算优势"的阶段
+    # 此函数直接输出的是:  all_diffusion_output, advantage, reward, sub_rewards
+    # 它做的工作是: 生成轨迹 -> 评估轨迹 -> 形成训练信号， get_rlloss 可以把这些信号变成loss
     def forward_train_rl(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature, targets,global_img, eta,metric_cache,cal_pdm,token) -> Dict[str, torch.Tensor]:
         step_num = 10
         bs = ego_query.shape[0]
         device = ego_query.device
+
+        # denoising 时间表, 训练里不是跑很长diffusion链，而是只跑一个很短的截断链
+        # 不是标准"1000步慢慢去噪", 而是"在很少的关键步上快速 refinement"
         self.diffusionrl_scheduler.set_timesteps(1000, device)
         step_ratio = 20 / step_num
         roll_timesteps = (np.arange(0, step_num) * step_ratio).round()[::-1].copy().astype(np.int64)
@@ -810,9 +1052,15 @@ class TrajectoryHead(nn.Module):
         num_groups = self.num_groups
         
         # 1. add truncated noise to the plan anchor
+        # 训练时的总候选数时 4 groups * 20 anchors = 80 trajectories
+        # 直觉上，这是“同一个驾驶意图(anchor) 采样 num_groups条轨迹”，做 num_groups 次探索？ TODO
         plan_anchor = self.plan_anchor.unsqueeze(0).unsqueeze(0).repeat(bs,num_groups, 1, 1, 1)  
 
         plan_anchor = plan_anchor.view(bs, num_groups * self.ego_fut_mode, *plan_anchor.shape[3:]) # bs num_groups * 20, 8, 2
+        
+        # 先归一化，再加截断噪声， 这里的 diffusion_output 就是 plan_anchor, 初始 x_t
+        # 它不是纯随机噪声，也不是干净 anchor， 而是 "anchor 附近的带噪轨迹"
+        # 这与从白噪声开始采样很不一样，因为它一开始就带驾驶意图先验
         diffusion_output = self.norm_odo(plan_anchor)
 
         noise = torch.randn(diffusion_output.shape, device=device)
@@ -1167,5 +1415,3 @@ class TrajectoryHead(nn.Module):
         # yaw = atan2(dy, dx)
         dx, dy = deriv[..., 0], deriv[..., 1]
         yaw = torch.atan2(dy, dx).unsqueeze(-1)         # (B,G,8,1)
-
-        return torch.cat([xy8, yaw], dim=-1)            # (B,G,8,3)
